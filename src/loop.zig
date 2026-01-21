@@ -11,7 +11,7 @@ const SigHandler = struct {
 };
 
 pub const Loop = struct {
-    queue: queue.Queue(Event, 16) = .init(),
+    queue: queue.Queue(Event, 16),
 
     tty: *root.tty.Tty,
     thread: ?std.Thread = null,
@@ -19,8 +19,8 @@ pub const Loop = struct {
 
     const Self = @This();
 
-    pub fn init(term: *tty.Tty) !Self {
-        return .{ .tty = term };
+    pub fn init(io: std.Io, term: *tty.Tty) !Self {
+        return .{ .queue = .init(io), .tty = term };
     }
 
     pub fn start(self: *Self) !void {
@@ -30,7 +30,7 @@ pub const Loop = struct {
 
     pub fn stop(self: *Self) void {
         self.should_stop.store(true, .release);
-        // deinit memmory on foreign thread
+        // deinit memory on foreign thread
     }
 
     var handler: ?SigHandler = null;
@@ -41,20 +41,20 @@ pub const Loop = struct {
         // setup signal handler for window size change
         const action = posix.Sigaction{
             .handler = .{ .handler = Self.handleWinSizeSig },
-            .mask = posix.empty_sigset,
+            .mask = posix.sigemptyset(),
             .flags = 0,
         };
         posix.sigaction(posix.SIG.WINCH, &action, null);
     }
 
-    fn handleWinSizeSig(_: c_int) callconv(.c) void {
+    fn handleWinSizeSig(_: std.os.linux.SIG) callconv(.c) void {
         if (handler) |hdl| hdl.handlerFn(hdl.ctx);
     }
 
     fn handleWinSizeChange(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const win_size = self.tty.getWinsize() catch unreachable;
-        self.queue.pushFront(.{ .win_size = win_size });
+        self.queue.pushFront(.{ .win_size = win_size }) catch unreachable;
     }
 
     fn parseEvent(buf: []const u8) !?Event {
@@ -83,12 +83,11 @@ pub const Loop = struct {
 
     fn run(self: *Self) !void {
         while (true) {
-            var buf: [10]u8 = undefined;
-            // just pray for the read to be fast enough
-            const len = try self.tty.anyReader().read(&buf);
+            var buf: [16]u8 = undefined;
+            const len = try self.tty.reader.interface.readSliceShort(&buf);
 
             const ev = try Self.parseEvent(buf[0..len]) orelse continue;
-            self.queue.pushFront(ev);
+            try self.queue.pushFront(ev);
         }
     }
 

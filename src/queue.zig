@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 pub fn Queue(
     comptime T: type,
@@ -10,42 +11,43 @@ pub fn Queue(
         len: usize = 0,
         tail_idx: usize = 0,
 
-        mutex: std.Thread.Mutex = .{},
-        not_full: std.Thread.Condition = .{},
-        not_empty: std.Thread.Condition = .{},
+        io: Io,
+        mutex: Io.Mutex = .init,
+        not_full: Io.Condition = .init,
+        not_empty: Io.Condition = .init,
 
         const Self = @This();
 
-        pub fn init() Self {
-            return .{};
+        pub fn init(io: Io) Self {
+            return .{ .io = io };
         }
 
-        pub fn pushFront(self: *Self, el: T) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+        pub fn pushFront(self: *Self, el: T) !void {
+            try self.mutex.lock(self.io);
+            defer self.mutex.unlock(self.io);
 
             while (self.len == size) {
-                self.not_full.wait(&self.mutex);
+                try self.not_full.wait(self.io, &self.mutex);
             }
 
             if (self.len == 0) {
-                self.not_empty.signal();
+                self.not_empty.signal(self.io);
             }
 
             self.buf[(self.tail_idx + self.len) % size] = el;
             self.len += 1;
         }
 
-        pub fn popBack(self: *Self) T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+        pub fn popBack(self: *Self) !T {
+            try self.mutex.lock(self.io);
+            defer self.mutex.unlock(self.io);
 
             while (self.len == 0) {
-                self.not_empty.wait(&self.mutex);
+                try self.not_empty.wait(self.io, &self.mutex);
             }
 
             if (self.len == size) {
-                self.not_full.signal();
+                self.not_full.signal(self.io);
             }
 
             const el = self.buf[self.tail_idx];

@@ -5,21 +5,28 @@ pub const tty = @import("./tty.zig");
 pub const queue = @import("./queue.zig");
 pub const loop = @import("./loop.zig");
 
-pub fn main() !void {
-    const alloc = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    const io = init.io;
 
-    const out = std.io.getStdOut();
-    try out.writer().print(ctrlseq.color.colorStr("Welcome to Minesweeper!\n", ctrlseq.color.red), .{});
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    defer stdout.flush() catch {};
+    try stdout.print(ctrlseq.color.colorStr("Welcome to Minesweeper!\n", ctrlseq.color.red), .{});
 
-    var term = try tty.Tty.init();
+    var term_read_buf: [256]u8 = undefined;
+    var term_write_buf: [256]u8 = undefined;
+    var term = try tty.Tty.init(io, &term_read_buf, &term_write_buf);
     defer term.deinit();
 
-    var lp = try loop.Loop.init(&term);
+    var lp = try loop.Loop.init(io, &term);
 
     try lp.start();
     defer lp.stop();
 
-    var grid = try Grid.init(alloc, .{ .height = 10, .width = 20, .nb_of_bombs = 30 });
+    const seed = std.Io.Clock.now(.real, io).toMicroseconds();
+    var grid = try Grid.init(alloc, @bitCast(seed), .{ .height = 10, .width = 20, .nb_of_bombs = 30 });
     defer grid.deinit();
 
     grid.reset();
@@ -30,7 +37,7 @@ pub fn main() !void {
 
     while (true) {
         // draw
-        var writer = term.anyWriter();
+        var writer = term.writer.interface;
         try writer.print(ctrlseq.erase_display ++ ctrlseq.cursor_home, .{});
         try grid.display(&writer);
 
@@ -42,7 +49,7 @@ pub fn main() !void {
             },
             .win_size => |ws| {
                 if ((ws.col < grid.options.width) or (ws.row < grid.options.height)) {
-                    try term.anyWriter().print(ctrlseq.erase_display ++ ctrlseq.cursor_home ++ "The terminal is not large enough", .{});
+                    try term.writer.interface.print(ctrlseq.erase_display ++ ctrlseq.cursor_home ++ "The terminal is not large enough", .{});
                     lock_game = true;
                 } else {
                     lock_game = false;
@@ -70,21 +77,22 @@ pub fn main() !void {
 
     try term.exitGameScreen();
 
-    var writer = out.writer().any();
-    try grid.displayClear(&writer);
+    try grid.displayClear(stdout);
 
     if (grid.allBombsUncovered()) {
-        try out.writer().print("You win!\r\n", .{});
+        try stdout.print("You win!\r\n", .{});
     } else if (grid.exploded) {
-        try out.writer().print("You exploded!\r\n", .{});
+        try stdout.print("You exploded!\r\n", .{});
     } else {
-        try out.writer().print("You abandoned!\r\n", .{});
+        try stdout.print("You abandoned!\r\n", .{});
     }
 }
 
 const Position = struct { x: u32, y: u32 };
 
 const Grid = struct {
+    alloc: std.mem.Allocator,
+
     cells: std.ArrayList(Cell),
     options: Self.Options,
     prng: std.Random.DefaultPrng,
@@ -97,24 +105,22 @@ const Grid = struct {
     const Idx = usize;
     const Options = struct { width: u32, height: u32, nb_of_bombs: u32 };
 
-    fn init(alloc: std.mem.Allocator, options: Self.Options) !Self {
-        var cells = std.ArrayList(Cell).init(alloc);
+    fn init(alloc: std.mem.Allocator, seed: u64, options: Self.Options) !Self {
+        const grid_len = options.width * options.height;
+        var cells = try std.ArrayList(Cell).initCapacity(alloc, grid_len);
 
-        const seed = std.time.microTimestamp();
-        const prng = std.Random.DefaultPrng.init(@bitCast(seed));
+        const prng = std.Random.DefaultPrng.init(seed);
 
         // make all cells default
-        const grid_len = options.width * options.height;
-        try cells.ensureTotalCapacity(grid_len);
         for (0..grid_len) |_| {
-            try cells.append(.{});
+            try cells.append(alloc, .{});
         }
 
-        return .{ .cells = cells, .options = options, .prng = prng };
+        return .{ .alloc = alloc, .cells = cells, .options = options, .prng = prng };
     }
 
     fn deinit(self: *Self) void {
-        self.cells.deinit();
+        self.cells.deinit(self.alloc);
     }
 
     fn reset(self: *Self) void {
@@ -125,7 +131,7 @@ const Grid = struct {
             const cell = &self.cells.items[rpos];
 
             switch (cell.content) {
-                .count => |_| {
+                .count => {
                     nb_of_bombs -= 1;
                     cell.content = .bomb;
                 },
@@ -169,7 +175,7 @@ const Grid = struct {
         };
     }
 
-    fn display(self: *const Self, writer: *std.io.AnyWriter) !void {
+    fn display(self: *const Self, writer: *std.Io.Writer) !void {
         for (self.cells.items, 0..) |cell, idx| {
             try cell.display(writer);
             try writer.print(" ", .{});
@@ -177,7 +183,7 @@ const Grid = struct {
         }
     }
 
-    fn displayClear(self: *const Self, writer: anytype) !void {
+    fn displayClear(self: *const Self, writer: *std.Io.Writer) !void {
         for (self.cells.items, 0..) |cell, idx| {
             try cell.displayContent(writer);
             try writer.print(" ", .{});
@@ -240,7 +246,7 @@ const Cell = struct {
     state: CellState = .covered,
     content: CellContent = .{ .count = 0 },
 
-    fn display(self: *const Cell, writer: *std.io.AnyWriter) !void {
+    fn display(self: *const Cell, writer: *std.Io.Writer) !void {
         return switch (self.state) {
             .flagged => try writer.print(ctrlseq.color.colorStr("~", ctrlseq.color.orange), .{}),
             .covered => try writer.print("-", .{}),
@@ -248,7 +254,7 @@ const Cell = struct {
         };
     }
 
-    fn displayContent(self: *const Cell, writer: *std.io.AnyWriter) !void {
+    fn displayContent(self: *const Cell, writer: *std.Io.Writer) !void {
         return switch (self.content) {
             .count => |num| if (num == 0) {
                 try writer.print("0", .{});
