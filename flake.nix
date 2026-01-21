@@ -10,27 +10,21 @@
       forAllSystems = genAttrs [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAllPkgs = function: forAllSystems (system: function pkgs.${system});
 
-      pkgs = forAllSystems (system: (import nixpkgs {
+      pkgs = forAllSystems (system: import nixpkgs {
         inherit system;
         overlays = [ ];
-      }));
+      });
     in
     {
       formatter = forAllPkgs (pkgs: pkgs.nixpkgs-fmt);
 
-      devShells = forAllPkgs (pkgs:
-        with pkgs.lib;
-        {
-          default = pkgs.mkShell rec {
-            nativeBuildInputs = with pkgs; [
-              zig
-              zls
-            ];
-
-            buildInputs = [ ];
-
-            LD_LIBRARY_PATH = makeLibraryPath buildInputs;
-          };
-        });
+      devShells = forAllPkgs (pkgs: {
+        default = pkgs.mkShell {
+          packages = with pkgs; [
+            zig
+            zls
+          ];
+        };
+      });
     };
 }
